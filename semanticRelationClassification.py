@@ -63,16 +63,22 @@ class DataFormater(object):
 
         with open(xFileName) as inFile:
             for line in inFile:
-                wordList = re.findall(r"[\w'<>/]+|[.,!?;]", line.rstrip().split('\t')[1][1:-1])
+                wordList = re.findall(r"[\w<>/]+|[.,!?;]", line.rstrip().split('\t')[1][1:-1])
                 length = len(wordList)
                 self.testSeqLenList += [length]
                 
-                qList = [[0] for _ in range(length)]
+                qList = []
                 for wordInd in range(len(wordList)):
-                    if wordList[wordInd].startswith('<e'):
-                        wordList[wordInd] = wordList[wordInd][4:-5]
-                        qList[wordInd][0] = 1
-
+                    word = wordList[wordInd]
+                    if word.startswith('<') and word.endswith('>'):
+                        wordList[wordInd] = word[4:-5]
+                        qList += [wordInd]
+                    elif word.endswith('>'):
+                        wordList[wordInd] = word[:-5]
+                        qList += [wordInd]
+                    elif word.startswith('<'):
+                        wordList[wordInd] = word[4:]
+                
                 self.testXList += [np.array(wordList)]
                 self.testXQList += [qList]
         
@@ -92,15 +98,21 @@ class DataFormater(object):
             lineState = 0
             for line in inFile:
                 if lineState == 0:
-                    wordList = re.findall(r"[\w'<>/]+|[.,!?;]", line.rstrip().split('\t')[1][1:-1])
+                    wordList = re.findall(r"[\w<>/]+|[.,!?;]", line.rstrip().split('\t')[1][1:-1])
                     length = len(wordList)
                     self.seqLenList += [length]
                     
-                    qList = [[0] for _ in range(length)]
+                    qList = []
                     for wordInd in range(len(wordList)):
-                        if wordList[wordInd].startswith('<e'):
-                            wordList[wordInd] = wordList[wordInd][4:-5]
-                            qList[wordInd][0] = 1
+                        word = wordList[wordInd]
+                        if word.startswith('<') and word.endswith('>'):
+                            wordList[wordInd] = word[4:-5]
+                            qList += [wordInd]
+                        elif word.endswith('>'):
+                            wordList[wordInd] = word[:-5]
+                            qList += [wordInd]
+                        elif word.startswith('<'):
+                            wordList[wordInd] = word[4:]
 
                     self.trainXList += [np.array(wordList)]
                     self.trainXQList += [qList]
@@ -120,12 +132,13 @@ class DataFormater(object):
         self.maxSeqLen = max([len(x) for x in self.trainXList])
         self.trainXArr = np.array([[self.wordIndDict.get(word, self.wordNum) for word in x] + [self.wordNum] * (self.maxSeqLen - len(x)) for x in self.trainXList])
         self.trainYArr = np.array([[self.yIndDict[y[0]]] for y in self.trainYList])
-        self.trainXQArr = np.array([q + [[0] for _ in range(self.maxSeqLen - len(q))] for q in self.trainXQList])
+        self.trainXQArr = np.array(self.trainXQList)
         self.seqLenArr = np.array(self.seqLenList)
+        print ('shape of trainXQArr: ', self.trainXQArr.shape)
 
         self.testXArr = np.array([[self.wordIndDict.get(word, self.wordNum) for word in x] + [self.wordNum] * (self.maxSeqLen - len(x)) for x in self.testXList])
         self.testYArr = np.array([[self.yIndDict[y[0]]] for y in self.testYList])
-        self.testXQArr = np.array([q + [[0] for _ in range(self.maxSeqLen - len(q))] for q in self.testXQList])
+        self.testXQArr = np.array(self.testXQList)
         self.testSeqLenArr = np.array(self.testSeqLenList)
 
     def saveEmbedTable(self, fileName):
@@ -145,20 +158,27 @@ class BiDirRnnModel():
         self.inputXQPH = None
         self.loss = None
 
-    def buildModel(self, embedDim, seqLen, yNum, wtStddev, biasStddev, embedTable, rnnHiddenDim, useRnnOutput):
+    def buildModel(self, embedDim, seqLen, yNum, wtStddev, biasStddev, embedTable, rnnHiddenDim, useRnnOutput, fcNum):
 
         with tf.name_scope('input_PH'):
+
             self.inputXPH = tf.placeholder('int32', [None, seqLen])
             self.inputYPH = tf.placeholder('int32', [None, 1])
             self.inputSeqLenPH = tf.placeholder('int32', [None])
-            self.inputXQPH = tf.placeholder('float64', [None, seqLen, 1])
+            self.inputXQPH = tf.placeholder('int32', [None, 2])
+            self.dropKeepProPH = tf.placeholder_with_default(1.0, shape = [])
 
         with tf.name_scope('embedding'):
+
             embedTable = tf.constant(embedTable, dtype = tf.float64)
             embeddedSeqPH = tf.nn.embedding_lookup(embedTable, self.inputXPH)
-            fullEmbeddedSeqPH = tf.concat([embeddedSeqPH, self.inputXQPH], axis = 2)
+            qPH = tf.transpose(tf.one_hot(self.inputXQPH, seqLen, dtype = 'float64'), perm = [0, 2, 1])
+            print ('qPH: ', qPH.shape)
+            fullEmbeddedSeqPH = tf.concat([embeddedSeqPH, qPH], axis = 2)
+            print ('fullEmbeddedSeqPH: ', fullEmbeddedSeqPH.shape)
 
         with tf.name_scope('bi-directional_rnn'):
+
             fwLstmCell = tf.nn.rnn_cell.BasicLSTMCell(rnnHiddenDim, state_is_tuple = False)
             bwLstmCell = tf.nn.rnn_cell.BasicLSTMCell(rnnHiddenDim, state_is_tuple = False)
 
@@ -166,15 +186,43 @@ class BiDirRnnModel():
             (fwOutput, bwOutput), (fwState, bwState) = tupTup
             biOutput = tf.concat([fwOutput, bwOutput], axis = 2)
             biState = tf.concat([fwState, bwState], axis = 1)
-            fcInPH = biState #if not useRnnOutput else tf.concat([biState, ] , axis = 1)
+            #print ('shape of fwState, bwState: ', fwState.get_shape(), bwState.get_shape())
+            print ('shape of biOutput: ', biOutput.get_shape())
+            print ('shape of biState: ', biState.get_shape())
+
+            if useRnnOutput:
+
+                batchSize = tf.shape(self.inputXPH)[0]
+                rangePH = tf.range(batchSize, dtype = 'int32')
+                indicesPHPre = tf.tile(tf.expand_dims(tf.expand_dims(rangePH, axis = 1), axis = 2), multiples = [1, 2, 1])
+                indicesPH = tf.concat([indicesPHPre, tf.expand_dims(self.inputXQPH, axis = 2)], axis = 2)
+                qBiOutput = tf.gather_nd(biOutput, indicesPH)
+                
+                qSh = qBiOutput.get_shape()
+                fcInPH = tf.concat([biState, tf.reshape(qBiOutput, [-1, qSh[1] * qSh[2]])], axis = 1)
+
+            else:
+                fcInPH = biState
 
         with tf.name_scope('fully_connected_layer'):
-            outputPH = self.fcLayer(fcInPH, yNum, wtStddev, biasStddev)
+
+            inNodeNum = 8 * rnnHiddenDim if useRnnOutput else 4 * rnnHiddenDim
+            nodeNumList = self.getNodeNumList(inNodeNum, yNum, fcNum)
+            
+            for layerInd in range(fcNum):
+                fcInPH = tf.nn.dropout(fcInPH, keep_prob = tf.cast(self.dropKeepProPH, 'float64')) if layerInd != 0 else fcInPH
+                fcInPH = self.fcLayer(fcInPH, nodeNumList[layerInd], wtStddev, biasStddev)
+                if layerInd != fcNum-1:
+                    fcInPH = tf.nn.relu(fcInPH)
+            outputPH = fcInPH
+
             self.predY = tf.argmax(outputPH, axis = 1)
             lossPre = tf.nn.softmax_cross_entropy_with_logits(labels = tf.one_hot(self.inputYPH, yNum), logits = outputPH)
             self.loss = tf.reduce_sum(lossPre)
 
-    def trainModel(self, epochNum, learningRate, batchSize, trainXArr, trainYArr, trainXQArr, seqLenArr, testXArr, testYArr, testXQArr, testSeqLenArr, indToYDict, outputFileName):
+    def trainModel(self, epochNum, learningRate, trainXArr, trainYArr, trainXQArr, seqLenArr, testXArr, testYArr, testXQArr, testSeqLenArr, indToYDict, outputFileName, batchSize, dropKeepPro):
+
+        print ('fileName: ', outputFileName)
 
         optimizer = tf.train.AdamOptimizer(learning_rate = learningRate).minimize(self.loss)
         feedDict = {self.inputXPH: trainXArr, self.inputYPH: trainYArr, self.inputXQPH: trainXQArr, self.inputSeqLenPH: seqLenArr}
@@ -189,6 +237,7 @@ class BiDirRnnModel():
 
                 for batchInd in range(batchNum):
                     batchFeedDict = self.getBatch(feedDict, batchSize, batchInd * batchSize)
+                    batchFeedDict[self.dropKeepProPH] = dropKeepPro
                     sess.run(optimizer, feed_dict = batchFeedDict)
                 
                 print ('loss: ', sess.run(self.loss, feed_dict = feedDict))
@@ -222,6 +271,16 @@ class BiDirRnnModel():
         
         return tf.matmul(inPH, wt) + bias
 
+    def getNodeNumList(self, inDim, outDim, layerNum):
+        upList = [inDim]
+        downList = [outDim]
+        for layerInd in range(layerNum-1):
+            if upList[-1] * 1.5 < downList[-1] * 2:
+                upList += [upList[-1] * 1.5]
+            else:
+                downList += [downList[-1] * 2]
+        return upList[1:] + downList[::-1]
+
 if __name__ == '__main__':
     df = DataFormater()
     df.loadEmbedTableFile('embedTable.pkl')
@@ -232,5 +291,5 @@ if __name__ == '__main__':
     #df.saveEmbedTable('embedTable.pkl')
 
     bdmd = BiDirRnnModel()
-    bdmd.buildModel(embedDim = df.embedDim, seqLen = df.maxSeqLen, yNum = df.yNum, wtStddev = 0.1, biasStddev = 0.01, embedTable = df.embeddingArr, rnnHiddenDim = 64, useRnnOutput = True)
-    bdmd.trainModel(epochNum = 40, learningRate = 0.001, batchSize = 128, trainXArr = df.trainXArr, trainYArr = df.trainYArr, trainXQArr = df.trainXQArr, seqLenArr = df.seqLenArr, testXArr = df.testXArr, testYArr = df.testYArr, testXQArr = df.testXQArr, testSeqLenArr = df.testSeqLenArr, indToYDict = df.indToYDict, outputFileName = 'answer_hid64.txt')
+    bdmd.buildModel(embedDim = df.embedDim, seqLen = df.maxSeqLen, yNum = df.yNum, wtStddev = 0.1, biasStddev = 0.01, embedTable = df.embeddingArr, rnnHiddenDim = 8, useRnnOutput = True, fcNum = 1)
+    bdmd.trainModel(epochNum = 100, learningRate = 0.001, trainXArr = df.trainXArr, trainYArr = df.trainYArr, trainXQArr = df.trainXQArr, seqLenArr = df.seqLenArr, testXArr = df.testXArr, testYArr = df.testYArr, testXQArr = df.testXQArr, testSeqLenArr = df.testSeqLenArr, indToYDict = df.indToYDict, outputFileName = 'answer_hid8_useOutput_fc1_drop1.0.txt', batchSize = 128, dropKeepPro = 1.0)
